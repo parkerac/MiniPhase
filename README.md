@@ -39,11 +39,8 @@ python3 phasing/scripts/phase_nearby_variants.py \
 
 ```bash
 python3 phasing/scripts/phase_nearby_variants.py \
-  --bam sample.bam \
   --reference GRCh38.fa \
   --pairs-tsv variant_pairs.tsv \
-  --vcf sample.vcf.gz \
-  --sample SAMPLE_ID \
   --threads 8 \
   --out phase_results.tsv
 ```
@@ -54,17 +51,24 @@ The batch TSV must contain:
 chrom	pos1	ref1	alt1	pos2	ref2	alt2
 ```
 
+It can also contain sample-specific input columns:
+
+```text
+chrom	pos1	ref1	alt1	pos2	ref2	alt2	bam	vcf	sample	reference
+chr1	100000	A	G	100120	C	T	sample1.bam	sample1.vcf.gz	SAMPLE1	GRCh38.fa
+chr1	200000	G	A	200180	T	C	sample2.bam	sample2.vcf.gz	SAMPLE2	GRCh38.fa
+```
+
+`bam`, `vcf`, `sample`, and `reference` columns override the matching command-line values for that row. This means you can provide common defaults globally and only include columns that vary by sample. `bam` is required either as `--bam` or as a `bam` column.
+
 `--threads` controls the number of worker processes. Output row order matches the input TSV order.
 
 For very large batches, increasing `--chunksize` can reduce multiprocessing overhead:
 
 ```bash
 python3 phasing/scripts/phase_nearby_variants.py \
-  --bam sample.bam \
   --reference GRCh38.fa \
   --pairs-tsv variant_pairs.tsv \
-  --vcf sample.vcf.gz \
-  --sample SAMPLE_ID \
   --threads 8 \
   --chunksize 20 \
   --out phase_results.tsv

@@ -229,6 +229,8 @@ def write_fragment_evidence(path, variants, fragments):
 
 
 def phase_one(args, variant1, variant2):
+    if not args.bam:
+        raise ValueError("Missing BAM path; provide --bam or a bam column in --pairs-tsv")
     if variant1.chrom != variant2.chrom:
         raise ValueError("Both variants must be on the same chromosome")
     targets = [variant1, variant2]
@@ -243,6 +245,9 @@ def phase_one(args, variant1, variant2):
             "variant1": f"{variant1.chrom}:{variant1.pos}:{variant1.ref}:{variant1.alt}",
             "variant2": f"{variant2.chrom}:{variant2.pos}:{variant2.ref}:{variant2.alt}",
             "region": f"{variant1.chrom}:{max(1, span_start)}-{span_end}",
+            "bam": args.bam,
+            "vcf": args.vcf or "",
+            "sample": args.sample or "",
             "bridge_variants": len(bridges),
         }
     )
@@ -250,21 +255,39 @@ def phase_one(args, variant1, variant2):
 
 
 def phase_one_row(item):
-    args, variant1, variant2 = item
+    row_index, args, variant1, variant2 = item
     result, _, _ = phase_one(args, variant1, variant2)
+    result["row_index"] = row_index
     return result
+
+
+def row_value(row, key, default=None):
+    value = row.get(key)
+    return default if value is None or value == "" else value
 
 
 def pair_rows(args):
     if args.pairs_tsv:
         with open(args.pairs_tsv, newline="") as fh:
-            for row in csv.DictReader(fh, delimiter="\t"):
+            reader = csv.DictReader(fh, delimiter="\t")
+            required = {"chrom", "pos1", "ref1", "alt1", "pos2", "ref2", "alt2"}
+            missing = required - set(reader.fieldnames or [])
+            if missing:
+                raise ValueError(f"{args.pairs_tsv} is missing columns: {', '.join(sorted(missing))}")
+            for row_index, row in enumerate(reader, start=1):
+                row_args = argparse.Namespace(**vars(args))
+                row_args.bam = row_value(row, "bam", args.bam)
+                row_args.vcf = row_value(row, "vcf", args.vcf)
+                row_args.sample = row_value(row, "sample", args.sample)
+                row_args.reference = row_value(row, "reference", args.reference)
                 yield (
+                    row_index,
+                    row_args,
                     Variant(row["chrom"], int(row["pos1"]), row["ref1"].upper(), row["alt1"].upper(), "variant1", True),
                     Variant(row["chrom"], int(row["pos2"]), row["ref2"].upper(), row["alt2"].upper(), "variant2", True),
                 )
     else:
-        yield parse_variant(args.variant1, "variant1"), parse_variant(args.variant2, "variant2")
+        yield 1, args, parse_variant(args.variant1, "variant1"), parse_variant(args.variant2, "variant2")
 
 
 def init_worker():
@@ -277,13 +300,13 @@ def init_worker():
 def main():
     global pysam
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bam", required=True, help="Coordinate-sorted, indexed BAM or CRAM")
+    parser.add_argument("--bam", help="Coordinate-sorted, indexed BAM or CRAM; optional in batch mode if pairs TSV has bam")
     parser.add_argument("--reference", help="Reference FASTA; required for CRAM and recommended for indels")
     parser.add_argument("--variant1", help="First target as chrom:pos:ref:alt")
     parser.add_argument("--variant2", help="Second target as chrom:pos:ref:alt")
-    parser.add_argument("--pairs-tsv", help="Batch TSV with chrom,pos1,ref1,alt1,pos2,ref2,alt2")
-    parser.add_argument("--vcf", help="Optional indexed VCF/BCF of nearby heterozygous bridge variants")
-    parser.add_argument("--sample", help="Sample name in VCF; defaults to first sample")
+    parser.add_argument("--pairs-tsv", help="Batch TSV with chrom,pos1,ref1,alt1,pos2,ref2,alt2 and optional bam,vcf,sample,reference")
+    parser.add_argument("--vcf", help="Optional indexed VCF/BCF of nearby heterozygous bridge variants; can be overridden per batch row")
+    parser.add_argument("--sample", help="Sample name in VCF; can be overridden per batch row; defaults to first sample")
     parser.add_argument("--window", type=int, default=1000, help="Bases to fetch around target pair")
     parser.add_argument("--max-bridges", type=int, default=200, help="Maximum nearby heterozygous variants to use")
     parser.add_argument("--min-mapq", type=int, default=20)
@@ -306,6 +329,8 @@ def main():
         raise SystemExit("Provide either --pairs-tsv or both --variant1 and --variant2")
     if not args.pairs_tsv and not (args.variant1 and args.variant2):
         raise SystemExit("Provide both --variant1 and --variant2")
+    if not args.pairs_tsv and not args.bam:
+        raise SystemExit("Provide --bam for single-pair mode")
     if args.pairs_tsv and (args.evidence or args.json):
         raise SystemExit("--evidence and --json are only supported for single-pair runs")
     if args.threads < 1 or args.chunksize < 1:
@@ -313,13 +338,14 @@ def main():
 
     rows = []
     last = None
-    pairs = list(pair_rows(args))
+    jobs = list(pair_rows(args))
     if args.pairs_tsv and args.threads > 1:
         with mp.Pool(args.threads, initializer=init_worker) as pool:
-            rows = list(pool.imap(phase_one_row, ((args, v1, v2) for v1, v2 in pairs), chunksize=args.chunksize))
+            rows = list(pool.imap(phase_one_row, jobs, chunksize=args.chunksize))
     else:
-        for variant1, variant2 in pairs:
-            result, variants, fragments = phase_one(args, variant1, variant2)
+        for row_index, row_args, variant1, variant2 in jobs:
+            result, variants, fragments = phase_one(row_args, variant1, variant2)
+            result["row_index"] = row_index
             rows.append(result)
             last = result, variants, fragments
 
