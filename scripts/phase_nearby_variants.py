@@ -126,9 +126,15 @@ def add_call(fragment, variant_index, allele, quality):
         fragment[variant_index] = None
 
 
+def is_cram(path):
+    return path.lower().endswith(".cram")
+
+
 def read_fragments(bam_path, reference, variants, start, end, min_mapq, min_baseq, include_duplicates):
     fragments = defaultdict(dict)
-    bam = pysam.AlignmentFile(bam_path, "rc" if bam_path.endswith(".cram") else "rb", reference_filename=reference)
+    if is_cram(bam_path) and not reference:
+        raise ValueError(f"{bam_path} is a CRAM; provide the shared reference with --reference")
+    bam = pysam.AlignmentFile(bam_path, "rc" if is_cram(bam_path) else "rb", reference_filename=reference)
     for read in bam.fetch(variants[0].chrom, max(0, start - 1), end):
         if read.mapping_quality < min_mapq or read.is_secondary or read.is_supplementary or read.is_qcfail:
             continue
@@ -230,7 +236,7 @@ def write_fragment_evidence(path, variants, fragments):
 
 def phase_one(args, variant1, variant2):
     if not args.bam:
-        raise ValueError("Missing BAM path; provide --bam or a bam column in --pairs-tsv")
+        raise ValueError("Missing alignment path; provide --bam or a bam column in --pairs-tsv")
     if variant1.chrom != variant2.chrom:
         raise ValueError("Both variants must be on the same chromosome")
     targets = [variant1, variant2]
@@ -279,7 +285,6 @@ def pair_rows(args):
                 row_args.bam = row_value(row, "bam", args.bam)
                 row_args.vcf = row_value(row, "vcf", args.vcf)
                 row_args.sample = row_value(row, "sample", args.sample)
-                row_args.reference = row_value(row, "reference", args.reference)
                 yield (
                     row_index,
                     row_args,
@@ -301,10 +306,10 @@ def main():
     global pysam
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bam", help="Coordinate-sorted, indexed BAM or CRAM; optional in batch mode if pairs TSV has bam")
-    parser.add_argument("--reference", help="Reference FASTA; required for CRAM and recommended for indels")
+    parser.add_argument("--reference", help="Shared reference FASTA; required for CRAM and recommended for indels")
     parser.add_argument("--variant1", help="First target as chrom:pos:ref:alt")
     parser.add_argument("--variant2", help="Second target as chrom:pos:ref:alt")
-    parser.add_argument("--pairs-tsv", help="Batch TSV with chrom,pos1,ref1,alt1,pos2,ref2,alt2 and optional bam,vcf,sample,reference")
+    parser.add_argument("--pairs-tsv", help="Batch TSV with chrom,pos1,ref1,alt1,pos2,ref2,alt2 and optional bam,vcf,sample")
     parser.add_argument("--vcf", help="Optional indexed VCF/BCF of nearby heterozygous bridge variants; can be overridden per batch row")
     parser.add_argument("--sample", help="Sample name in VCF; can be overridden per batch row; defaults to first sample")
     parser.add_argument("--window", type=int, default=1000, help="Bases to fetch around target pair")

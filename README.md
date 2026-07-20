@@ -51,15 +51,15 @@ The batch TSV must contain:
 chrom	pos1	ref1	alt1	pos2	ref2	alt2
 ```
 
-It can also contain sample-specific input columns:
+It can also contain sample-specific input columns. The `bam` column can contain BAM or CRAM paths.
 
 ```text
-chrom	pos1	ref1	alt1	pos2	ref2	alt2	bam	vcf	sample	reference
-chr1	100000	A	G	100120	C	T	sample1.bam	sample1.vcf.gz	SAMPLE1	GRCh38.fa
-chr1	200000	G	A	200180	T	C	sample2.bam	sample2.vcf.gz	SAMPLE2	GRCh38.fa
+chrom	pos1	ref1	alt1	pos2	ref2	alt2	bam	vcf	sample
+chr1	100000	A	G	100120	C	T	sample1.bam	sample1.vcf.gz	SAMPLE1
+chr1	200000	G	A	200180	T	C	sample2.cram	sample2.vcf.gz	SAMPLE2
 ```
 
-`bam`, `vcf`, `sample`, and `reference` columns override the matching command-line values for that row. This means you can provide common defaults globally and only include columns that vary by sample. `bam` is required either as `--bam` or as a `bam` column.
+`bam`, `vcf`, and `sample` columns override the matching command-line values for that row. This means you can provide common defaults globally and only include columns that vary by sample. `bam` is required either as `--bam` or as a `bam` column. `--reference` is shared across all rows and is required when any alignment file is CRAM.
 
 `--threads` controls the number of worker processes. Output row order matches the input TSV order.
 
