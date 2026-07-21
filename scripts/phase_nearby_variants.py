@@ -38,6 +38,22 @@ def parse_gt(gt):
     return set(alleles)
 
 
+def alt_status(sample_call, alt_index, min_gq, min_dp):
+    gt = sample_call.get("GT") if sample_call else None
+    if not gt or any(a is None for a in gt):
+        return "missing"
+    if "GQ" in sample_call and sample_call["GQ"] is not None and sample_call["GQ"] < min_gq:
+        return "low_quality"
+    if "DP" in sample_call and sample_call["DP"] is not None and sample_call["DP"] < min_dp:
+        return "low_quality"
+    alleles = set(gt)
+    if alt_index in alleles:
+        return "has_alt"
+    if alleles == {0}:
+        return "no_alt"
+    return "other_alt"
+
+
 def same_variant(a, b):
     return a.chrom == b.chrom and a.pos == b.pos and a.ref == b.ref and a.alt == b.alt
 
@@ -64,6 +80,70 @@ def load_bridge_variants(vcf_path, sample, chrom, start, end, targets, max_bridg
             if len(variants) >= max_bridges:
                 break
     return variants
+
+
+def load_parent_statuses(vcf_path, sample, chrom, start, end, variants, min_gq, min_dp):
+    statuses = {i: "missing" for i in range(len(variants))}
+    if not vcf_path:
+        return statuses, sample or ""
+    wanted = {(v.chrom, v.pos, v.ref, v.alt): i for i, v in enumerate(variants)}
+    with pysam.VariantFile(vcf_path) as vcf:
+        sample = sample or next(iter(vcf.header.samples), None)
+        if not sample:
+            return statuses, ""
+        if sample not in vcf.header.samples:
+            raise ValueError(f"{sample} is not present in {vcf_path}")
+        for rec in vcf.fetch(chrom, max(0, start - 1), end):
+            if not rec.alts:
+                continue
+            for alt_index, alt in enumerate(rec.alts, start=1):
+                key = (rec.chrom, rec.pos, rec.ref.upper(), alt.upper())
+                if key in wanted:
+                    statuses[wanted[key]] = alt_status(rec.samples[sample], alt_index, min_gq, min_dp)
+    return statuses, sample
+
+
+def infer_origin(mother_status, father_status):
+    if mother_status == "low_quality" or father_status == "low_quality":
+        return "low_quality"
+    if mother_status == "has_alt" and father_status == "no_alt":
+        return "maternal"
+    if father_status == "has_alt" and mother_status == "no_alt":
+        return "paternal"
+    if mother_status == "no_alt" and father_status == "no_alt":
+        return "conflicting"
+    return "uninformative"
+
+
+def trio_phase_from_origins(origin1, origin2):
+    if origin1 == "conflicting" or origin2 == "conflicting":
+        return "conflicting"
+    if origin1 not in {"maternal", "paternal"} or origin2 not in {"maternal", "paternal"}:
+        return "ambiguous"
+    return "cis" if origin1 == origin2 else "trans"
+
+
+def trio_edges(args, variants, chrom, start, end):
+    votes = defaultdict(lambda: [0.0, 0.0, 0])
+    origins = {i: "not_tested" for i in range(len(variants))}
+    if not args.mother_vcf or not args.father_vcf or args.trio_weight <= 0:
+        return votes, origins, 0, 0
+    mother, mother_sample = load_parent_statuses(args.mother_vcf, args.mother_sample, chrom, start, end, variants, args.min_parent_gq, args.min_parent_dp)
+    father, father_sample = load_parent_statuses(args.father_vcf, args.father_sample, chrom, start, end, variants, args.min_parent_gq, args.min_parent_dp)
+    args.mother_sample = mother_sample
+    args.father_sample = father_sample
+    for i in range(len(variants)):
+        origins[i] = infer_origin(mother[i], father[i])
+    known = [(i, origin) for i, origin in origins.items() if origin in {"maternal", "paternal"}]
+    for a in range(len(known)):
+        i, origin_i = known[a]
+        for j, origin_j in known[a + 1 :]:
+            relation = 0 if origin_i == origin_j else 1
+            votes[(i, j)][relation] += args.trio_weight
+            votes[(i, j)][2] += 1
+    target_origins = [origins.get(0, "not_tested"), origins.get(1, "not_tested")]
+    conflicts = sum(1 for origin in target_origins if origin == "conflicting")
+    return votes, origins, len(known), conflicts
 
 
 def insertion_after(aligned_pairs, pair_index, read):
@@ -169,6 +249,16 @@ def edge_votes(fragments):
     return votes, informative
 
 
+def merge_votes(*vote_sets):
+    merged = defaultdict(lambda: [0.0, 0.0, 0])
+    for votes in vote_sets:
+        for edge, values in votes.items():
+            merged[edge][0] += values[0]
+            merged[edge][1] += values[1]
+            merged[edge][2] += values[2]
+    return merged
+
+
 def best_path(votes, source, target, skip_edge=None):
     graph = defaultdict(list)
     for (i, j), (cis, trans, _) in votes.items():
@@ -195,9 +285,14 @@ def best_path(votes, source, target, skip_edge=None):
     return best.get((target, 0), (0.0, [])), best.get((target, 1), (0.0, []))
 
 
-def classify_pair(variants, fragments):
-    votes, informative = edge_votes(fragments)
+def classify_pair(variants, fragments, trio_votes=None):
+    read_votes, informative = edge_votes(fragments)
+    trio_votes = trio_votes or {}
+    votes = merge_votes(read_votes, trio_votes)
+    direct_read = read_votes.get((0, 1), [0.0, 0.0, 0])
+    direct_trio = trio_votes.get((0, 1), [0.0, 0.0, 0])
     direct = votes.get((0, 1), [0.0, 0.0, 0])
+    read_cis_path, read_trans_path = best_path(read_votes, 0, 1, skip_edge=(0, 1))
     cis_path, trans_path = best_path(votes, 0, 1, skip_edge=(0, 1))
     direct_delta = direct[0] - direct[1]
     path_delta = cis_path[0] - trans_path[0]
@@ -209,9 +304,14 @@ def classify_pair(variants, fragments):
     return {
         "phase": phase,
         "score": round(score, 3),
-        "direct_cis_weight": round(direct[0], 3),
-        "direct_trans_weight": round(direct[1], 3),
-        "direct_fragments": direct[2],
+        "direct_cis_weight": round(direct_read[0], 3),
+        "direct_trans_weight": round(direct_read[1], 3),
+        "direct_fragments": direct_read[2],
+        "trio_direct_cis_weight": round(direct_trio[0], 3),
+        "trio_direct_trans_weight": round(direct_trio[1], 3),
+        "trio_score": round(direct_trio[0] - direct_trio[1], 3),
+        "best_read_cis_path_score": round(read_cis_path[0], 3),
+        "best_read_trans_path_score": round(read_trans_path[0], 3),
         "best_cis_path_score": round(cis_path[0], 3),
         "best_trans_path_score": round(trans_path[0], 3),
         "best_cis_path": ",".join(variants[i].name for i in cis_path[1]),
@@ -234,18 +334,9 @@ def write_fragment_evidence(path, variants, fragments):
             writer.writerow({"fragment": name, "n_variants": len(calls), "calls": call_text})
 
 
-def phase_one(args, variant1, variant2):
-    if not args.bam:
-        raise ValueError("Missing alignment path; provide --bam or a bam column in --pairs-tsv")
-    if variant1.chrom != variant2.chrom:
-        raise ValueError("Both variants must be on the same chromosome")
-    targets = [variant1, variant2]
-    span_start = min(variant1.pos, variant2.pos) - args.window
-    span_end = max(variant1.pos + len(variant1.ref), variant2.pos + len(variant2.ref)) + args.window
-    bridges = load_bridge_variants(args.vcf, args.sample, variant1.chrom, span_start, span_end, targets, args.max_bridges)
-    variants = targets + sorted(bridges, key=lambda v: v.pos)
-    fragments = read_fragments(args.bam, args.reference, variants, span_start, span_end, args.min_mapq, args.min_baseq, args.include_duplicates)
-    result = classify_pair(variants, fragments)
+def add_metadata(result, args, variant1, variant2, span_start, span_end, origins, trio_informative, trio_conflicts, bridge_count, method):
+    variant1_origin = origins.get(0, "not_tested")
+    variant2_origin = origins.get(1, "not_tested")
     result.update(
         {
             "variant1": f"{variant1.chrom}:{variant1.pos}:{variant1.ref}:{variant1.alt}",
@@ -254,9 +345,44 @@ def phase_one(args, variant1, variant2):
             "bam": args.bam,
             "vcf": args.vcf or "",
             "sample": args.sample or "",
-            "bridge_variants": len(bridges),
+            "father_vcf": args.father_vcf or "",
+            "mother_vcf": args.mother_vcf or "",
+            "father_sample": args.father_sample or "",
+            "mother_sample": args.mother_sample or "",
+            "variant1_origin": variant1_origin,
+            "variant2_origin": variant2_origin,
+            "trio_phase": trio_phase_from_origins(variant1_origin, variant2_origin),
+            "trio_informative_variants": trio_informative,
+            "trio_conflicts": trio_conflicts,
+            "bridge_variants": bridge_count,
+            "method": method,
         }
     )
+    return result
+
+
+def phase_one(args, variant1, variant2):
+    if variant1.chrom != variant2.chrom:
+        raise ValueError("Both variants must be on the same chromosome")
+    targets = [variant1, variant2]
+    span_start = min(variant1.pos, variant2.pos) - args.window
+    span_end = max(variant1.pos + len(variant1.ref), variant2.pos + len(variant2.ref)) + args.window
+
+    target_trio_votes, target_origins, target_trio_informative, target_trio_conflicts = trio_edges(args, targets, variant1.chrom, span_start, span_end)
+    target_trio_phase = trio_phase_from_origins(target_origins.get(0, "not_tested"), target_origins.get(1, "not_tested"))
+    if target_trio_phase in {"cis", "trans"} and not args.always_run_reads:
+        result = classify_pair(targets, {}, target_trio_votes)
+        result["phase"] = target_trio_phase
+        return add_metadata(result, args, variant1, variant2, span_start, span_end, target_origins, target_trio_informative, target_trio_conflicts, 0, "trio_first_pass"), targets, {}
+
+    if not args.bam:
+        raise ValueError("Trio first pass was not informative; provide --bam or a bam column in --pairs-tsv for read-backed phasing")
+    bridges = load_bridge_variants(args.vcf, args.sample, variant1.chrom, span_start, span_end, targets, args.max_bridges)
+    variants = targets + sorted(bridges, key=lambda v: v.pos)
+    trio_vote_set, origins, trio_informative, trio_conflicts = trio_edges(args, variants, variant1.chrom, span_start, span_end)
+    fragments = read_fragments(args.bam, args.reference, variants, span_start, span_end, args.min_mapq, args.min_baseq, args.include_duplicates)
+    result = classify_pair(variants, fragments, trio_vote_set)
+    result = add_metadata(result, args, variant1, variant2, span_start, span_end, origins, trio_informative, trio_conflicts, len(bridges), "read_backed")
     return result, variants, fragments
 
 
@@ -285,6 +411,10 @@ def pair_rows(args):
                 row_args.bam = row_value(row, "bam", args.bam)
                 row_args.vcf = row_value(row, "vcf", args.vcf)
                 row_args.sample = row_value(row, "sample", args.sample)
+                row_args.father_vcf = row_value(row, "father_vcf", args.father_vcf)
+                row_args.mother_vcf = row_value(row, "mother_vcf", args.mother_vcf)
+                row_args.father_sample = row_value(row, "father_sample", args.father_sample)
+                row_args.mother_sample = row_value(row, "mother_sample", args.mother_sample)
                 yield (
                     row_index,
                     row_args,
@@ -305,13 +435,21 @@ def init_worker():
 def main():
     global pysam
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bam", help="Coordinate-sorted, indexed BAM or CRAM; optional in batch mode if pairs TSV has bam")
+    parser.add_argument("--bam", help="Coordinate-sorted, indexed BAM or CRAM; required when trio first pass is uninformative")
     parser.add_argument("--reference", help="Shared reference FASTA; required for CRAM and recommended for indels")
     parser.add_argument("--variant1", help="First target as chrom:pos:ref:alt")
     parser.add_argument("--variant2", help="Second target as chrom:pos:ref:alt")
-    parser.add_argument("--pairs-tsv", help="Batch TSV with chrom,pos1,ref1,alt1,pos2,ref2,alt2 and optional bam,vcf,sample")
+    parser.add_argument("--pairs-tsv", help="Batch TSV with target variants and optional sample/proband/parent input columns")
     parser.add_argument("--vcf", help="Optional indexed VCF/BCF of nearby heterozygous bridge variants; can be overridden per batch row")
     parser.add_argument("--sample", help="Sample name in VCF; can be overridden per batch row; defaults to first sample")
+    parser.add_argument("--father-vcf", help="Optional father VCF/BCF for trio phasing; can be overridden per batch row")
+    parser.add_argument("--mother-vcf", help="Optional mother VCF/BCF for trio phasing; can be overridden per batch row")
+    parser.add_argument("--father-sample", help="Father sample name; can be overridden per batch row; defaults to first sample")
+    parser.add_argument("--mother-sample", help="Mother sample name; can be overridden per batch row; defaults to first sample")
+    parser.add_argument("--trio-weight", type=float, default=10.0, help="Weight added by each informative trio relationship")
+    parser.add_argument("--min-parent-gq", type=float, default=20.0, help="Minimum parent GQ when present")
+    parser.add_argument("--min-parent-dp", type=float, default=8.0, help="Minimum parent DP when present")
+    parser.add_argument("--always-run-reads", action="store_true", help="Run proband read-backed phasing even when target trio phasing is clear")
     parser.add_argument("--window", type=int, default=1000, help="Bases to fetch around target pair")
     parser.add_argument("--max-bridges", type=int, default=200, help="Maximum nearby heterozygous variants to use")
     parser.add_argument("--min-mapq", type=int, default=20)
@@ -334,8 +472,6 @@ def main():
         raise SystemExit("Provide either --pairs-tsv or both --variant1 and --variant2")
     if not args.pairs_tsv and not (args.variant1 and args.variant2):
         raise SystemExit("Provide both --variant1 and --variant2")
-    if not args.pairs_tsv and not args.bam:
-        raise SystemExit("Provide --bam for single-pair mode")
     if args.pairs_tsv and (args.evidence or args.json):
         raise SystemExit("--evidence and --json are only supported for single-pair runs")
     if args.threads < 1 or args.chunksize < 1:
