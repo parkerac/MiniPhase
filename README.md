@@ -59,9 +59,12 @@ It can also contain sample-specific input columns. The `bam` column can contain 
 chrom	pos1	ref1	alt1	pos2	ref2	alt2	bam	vcf	sample	father_vcf	mother_vcf	father_sample	mother_sample
 chr1	100000	A	G	100120	C	T	sample1.bam	sample1.vcf.gz	SAMPLE1	father1.vcf.gz	mother1.vcf.gz	FATHER1	MOTHER1
 chr1	200000	G	A	200180	T	C	sample2.cram	sample2.vcf.gz	SAMPLE2	father2.vcf.gz	mother2.vcf.gz	FATHER2	MOTHER2
+chr1	300000	C	A	300150	G	T	sample3.bam	sample3.vcf.gz	SAMPLE3	NA	NA	NA	NA
 ```
 
 `bam`, `vcf`, `sample`, `father_vcf`, `mother_vcf`, `father_sample`, and `mother_sample` columns override the matching command-line values for that row. This means you can provide common defaults globally and only include columns that vary by sample. `--reference` is shared across all rows and is required when any alignment file is CRAM.
+
+Parent columns can use `NA`, `N/A`, `.`, `None`, `null`, or an empty value when parent data is unavailable for a sample. Those rows skip trio first-pass phasing and use read-backed phasing.
 
 ## Trio VCF Phasing
 
@@ -83,7 +86,16 @@ By default, target-variant trio phasing is the first pass. If both target varian
 
 `bam` is required only when trio first-pass phasing is uninformative or when `--always-run-reads` is used.
 
-Trio-specific output columns include `trio_phase`, `trio_score`, `variant1_origin`, `variant2_origin`, `trio_informative_variants`, and `trio_conflicts`. The `method` column reports `trio_first_pass` when the proband alignment was skipped and `read_backed` when read-backed phasing was run.
+Trio-specific output columns include `trio_phase`, `trio_score`, `variant1_origin`, `variant2_origin`, `trio_informative_variants`, `trio_conflicts`, and `trio_status`. The `method` column reports `trio_first_pass` when the proband alignment was skipped and `read_backed` when read-backed phasing was run.
+
+`trio_status` values:
+
+```text
+available
+missing_parent_vcf
+missing_parent_file
+disabled
+```
 
 Useful trio options:
 

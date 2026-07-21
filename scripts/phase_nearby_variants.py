@@ -6,10 +6,12 @@ import csv
 import json
 import math
 import multiprocessing as mp
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 
 pysam = None
+MISSING_VALUES = {"", ".", "NA", "N/A", "NONE", "NULL", "NAN"}
 
 
 @dataclass(frozen=True)
@@ -123,10 +125,20 @@ def trio_phase_from_origins(origin1, origin2):
     return "cis" if origin1 == origin2 else "trans"
 
 
+def trio_status(args):
+    if args.trio_weight <= 0:
+        return "disabled"
+    if not args.mother_vcf or not args.father_vcf:
+        return "missing_parent_vcf"
+    if not os.path.exists(args.mother_vcf) or not os.path.exists(args.father_vcf):
+        return "missing_parent_file"
+    return "available"
+
+
 def trio_edges(args, variants, chrom, start, end):
     votes = defaultdict(lambda: [0.0, 0.0, 0])
     origins = {i: "not_tested" for i in range(len(variants))}
-    if not args.mother_vcf or not args.father_vcf or args.trio_weight <= 0:
+    if trio_status(args) != "available":
         return votes, origins, 0, 0
     mother, mother_sample = load_parent_statuses(args.mother_vcf, args.mother_sample, chrom, start, end, variants, args.min_parent_gq, args.min_parent_dp)
     father, father_sample = load_parent_statuses(args.father_vcf, args.father_sample, chrom, start, end, variants, args.min_parent_gq, args.min_parent_dp)
@@ -334,7 +346,7 @@ def write_fragment_evidence(path, variants, fragments):
             writer.writerow({"fragment": name, "n_variants": len(calls), "calls": call_text})
 
 
-def add_metadata(result, args, variant1, variant2, span_start, span_end, origins, trio_informative, trio_conflicts, bridge_count, method):
+def add_metadata(result, args, variant1, variant2, span_start, span_end, origins, trio_informative, trio_conflicts, bridge_count, method, status):
     variant1_origin = origins.get(0, "not_tested")
     variant2_origin = origins.get(1, "not_tested")
     result.update(
@@ -354,6 +366,7 @@ def add_metadata(result, args, variant1, variant2, span_start, span_end, origins
             "trio_phase": trio_phase_from_origins(variant1_origin, variant2_origin),
             "trio_informative_variants": trio_informative,
             "trio_conflicts": trio_conflicts,
+            "trio_status": status,
             "bridge_variants": bridge_count,
             "method": method,
         }
@@ -368,12 +381,13 @@ def phase_one(args, variant1, variant2):
     span_start = min(variant1.pos, variant2.pos) - args.window
     span_end = max(variant1.pos + len(variant1.ref), variant2.pos + len(variant2.ref)) + args.window
 
+    status = trio_status(args)
     target_trio_votes, target_origins, target_trio_informative, target_trio_conflicts = trio_edges(args, targets, variant1.chrom, span_start, span_end)
     target_trio_phase = trio_phase_from_origins(target_origins.get(0, "not_tested"), target_origins.get(1, "not_tested"))
     if target_trio_phase in {"cis", "trans"} and not args.always_run_reads:
         result = classify_pair(targets, {}, target_trio_votes)
         result["phase"] = target_trio_phase
-        return add_metadata(result, args, variant1, variant2, span_start, span_end, target_origins, target_trio_informative, target_trio_conflicts, 0, "trio_first_pass"), targets, {}
+        return add_metadata(result, args, variant1, variant2, span_start, span_end, target_origins, target_trio_informative, target_trio_conflicts, 0, "trio_first_pass", status), targets, {}
 
     if not args.bam:
         raise ValueError("Trio first pass was not informative; provide --bam or a bam column in --pairs-tsv for read-backed phasing")
@@ -382,7 +396,7 @@ def phase_one(args, variant1, variant2):
     trio_vote_set, origins, trio_informative, trio_conflicts = trio_edges(args, variants, variant1.chrom, span_start, span_end)
     fragments = read_fragments(args.bam, args.reference, variants, span_start, span_end, args.min_mapq, args.min_baseq, args.include_duplicates)
     result = classify_pair(variants, fragments, trio_vote_set)
-    result = add_metadata(result, args, variant1, variant2, span_start, span_end, origins, trio_informative, trio_conflicts, len(bridges), "read_backed")
+    result = add_metadata(result, args, variant1, variant2, span_start, span_end, origins, trio_informative, trio_conflicts, len(bridges), "read_backed", status)
     return result, variants, fragments
 
 
@@ -393,9 +407,13 @@ def phase_one_row(item):
     return result
 
 
-def row_value(row, key, default=None):
+def row_value(row, key, default=None, missing_overrides=False):
+    if key not in row:
+        return default
     value = row.get(key)
-    return default if value is None or value == "" else value
+    if value is None or value.strip().upper() in MISSING_VALUES:
+        return None if missing_overrides else default
+    return value
 
 
 def pair_rows(args):
@@ -411,10 +429,10 @@ def pair_rows(args):
                 row_args.bam = row_value(row, "bam", args.bam)
                 row_args.vcf = row_value(row, "vcf", args.vcf)
                 row_args.sample = row_value(row, "sample", args.sample)
-                row_args.father_vcf = row_value(row, "father_vcf", args.father_vcf)
-                row_args.mother_vcf = row_value(row, "mother_vcf", args.mother_vcf)
-                row_args.father_sample = row_value(row, "father_sample", args.father_sample)
-                row_args.mother_sample = row_value(row, "mother_sample", args.mother_sample)
+                row_args.father_vcf = row_value(row, "father_vcf", args.father_vcf, missing_overrides=True)
+                row_args.mother_vcf = row_value(row, "mother_vcf", args.mother_vcf, missing_overrides=True)
+                row_args.father_sample = row_value(row, "father_sample", args.father_sample, missing_overrides=True)
+                row_args.mother_sample = row_value(row, "mother_sample", args.mother_sample, missing_overrides=True)
                 yield (
                     row_index,
                     row_args,
