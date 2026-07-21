@@ -202,11 +202,12 @@ def count_parent_variant(bam_path, reference, variant, args):
         counts["status"] = "low_depth"
     elif counts["alt"] >= args.min_parent_bam_alt_depth and alt_frac >= args.min_parent_bam_alt_frac:
         counts["status"] = "has_alt"
-    elif counts["alt"] <= args.max_parent_bam_alt_depth_for_ref and alt_frac <= args.max_parent_bam_alt_frac:
+    elif counts["alt"] <= args.max_parent_bam_alt_depth_for_ref and alt_frac <= args.max_parent_bam_alt_frac_for_ref:
         counts["status"] = "no_alt"
     else:
         counts["status"] = "ambiguous"
     return counts
+
 
 def parent_bam_statuses(args, variants):
     out = {"mother": {}, "father": {}}
