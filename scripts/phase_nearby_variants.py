@@ -40,22 +40,6 @@ def parse_gt(gt):
     return set(alleles)
 
 
-def alt_status(sample_call, alt_index, min_gq, min_dp):
-    gt = sample_call.get("GT") if sample_call else None
-    if not gt or any(a is None for a in gt):
-        return "missing"
-    if "GQ" in sample_call and sample_call["GQ"] is not None and sample_call["GQ"] < min_gq:
-        return "low_quality"
-    if "DP" in sample_call and sample_call["DP"] is not None and sample_call["DP"] < min_dp:
-        return "low_quality"
-    alleles = set(gt)
-    if alt_index in alleles:
-        return "has_alt"
-    if alleles == {0}:
-        return "no_alt"
-    return "other_alt"
-
-
 def same_variant(a, b):
     return a.chrom == b.chrom and a.pos == b.pos and a.ref == b.ref and a.alt == b.alt
 
@@ -84,27 +68,6 @@ def load_bridge_variants(vcf_path, sample, chrom, start, end, targets, max_bridg
     return variants
 
 
-def load_parent_statuses(vcf_path, sample, chrom, start, end, variants, min_gq, min_dp, absent_status):
-    statuses = {i: absent_status for i in range(len(variants))}
-    if not vcf_path:
-        return statuses, sample or ""
-    wanted = {(v.chrom, v.pos, v.ref, v.alt): i for i, v in enumerate(variants)}
-    with pysam.VariantFile(vcf_path) as vcf:
-        sample = sample or next(iter(vcf.header.samples), None)
-        if not sample:
-            return statuses, ""
-        if sample not in vcf.header.samples:
-            raise ValueError(f"{sample} is not present in {vcf_path}")
-        for rec in vcf.fetch(chrom, max(0, start - 1), end):
-            if not rec.alts:
-                continue
-            for alt_index, alt in enumerate(rec.alts, start=1):
-                key = (rec.chrom, rec.pos, rec.ref.upper(), alt.upper())
-                if key in wanted:
-                    statuses[wanted[key]] = alt_status(rec.samples[sample], alt_index, min_gq, min_dp)
-    return statuses, sample
-
-
 def infer_origin(mother_status, father_status):
     if mother_status == "low_quality" or father_status == "low_quality":
         return "low_quality"
@@ -117,70 +80,12 @@ def infer_origin(mother_status, father_status):
     return "uninformative"
 
 
-def trio_phase_from_origins(origin1, origin2):
+def phase_from_origins(origin1, origin2):
     if origin1 == "conflicting" or origin2 == "conflicting":
         return "conflicting"
     if origin1 not in {"maternal", "paternal"} or origin2 not in {"maternal", "paternal"}:
         return "ambiguous"
     return "cis" if origin1 == origin2 else "trans"
-
-
-def trio_status(args):
-    if args.trio_weight <= 0:
-        return "disabled"
-    if not args.mother_vcf or not args.father_vcf:
-        return "missing_parent_vcf"
-    if not os.path.exists(args.mother_vcf) or not os.path.exists(args.father_vcf):
-        return "missing_parent_file"
-    return "available"
-
-
-def initial_parent_statuses(args, n_variants):
-    statuses = {
-        "mother": {i: "not_tested" for i in range(n_variants)},
-        "father": {i: "not_tested" for i in range(n_variants)},
-    }
-    if not args.mother_vcf:
-        statuses["mother"] = {i: "missing" for i in range(n_variants)}
-    elif not os.path.exists(args.mother_vcf):
-        statuses["mother"] = {i: "missing_file" for i in range(n_variants)}
-    if not args.father_vcf:
-        statuses["father"] = {i: "missing" for i in range(n_variants)}
-    elif not os.path.exists(args.father_vcf):
-        statuses["father"] = {i: "missing_file" for i in range(n_variants)}
-    return statuses
-
-
-def trio_edges(args, variants, chrom, start, end):
-    votes = defaultdict(lambda: [0.0, 0.0, 0])
-    origins = {i: "not_tested" for i in range(len(variants))}
-    parent_statuses = initial_parent_statuses(args, len(variants))
-    status = trio_status(args)
-    if status == "disabled":
-        return votes, origins, 0, 0, parent_statuses
-    if status != "available":
-        if args.mother_vcf and os.path.exists(args.mother_vcf):
-            parent_statuses["mother"], args.mother_sample = load_parent_statuses(args.mother_vcf, args.mother_sample, chrom, start, end, variants, args.min_parent_gq, args.min_parent_dp, args.absent_parent_record)
-        if args.father_vcf and os.path.exists(args.father_vcf):
-            parent_statuses["father"], args.father_sample = load_parent_statuses(args.father_vcf, args.father_sample, chrom, start, end, variants, args.min_parent_gq, args.min_parent_dp, args.absent_parent_record)
-        return votes, origins, 0, 0, parent_statuses
-    mother, mother_sample = load_parent_statuses(args.mother_vcf, args.mother_sample, chrom, start, end, variants, args.min_parent_gq, args.min_parent_dp, args.absent_parent_record)
-    father, father_sample = load_parent_statuses(args.father_vcf, args.father_sample, chrom, start, end, variants, args.min_parent_gq, args.min_parent_dp, args.absent_parent_record)
-    parent_statuses = {"mother": mother, "father": father}
-    args.mother_sample = mother_sample
-    args.father_sample = father_sample
-    for i in range(len(variants)):
-        origins[i] = infer_origin(mother[i], father[i])
-    known = [(i, origin) for i, origin in origins.items() if origin in {"maternal", "paternal"}]
-    for a in range(len(known)):
-        i, origin_i = known[a]
-        for j, origin_j in known[a + 1 :]:
-            relation = 0 if origin_i == origin_j else 1
-            votes[(i, j)][relation] += args.trio_weight
-            votes[(i, j)][2] += 1
-    target_origins = [origins.get(0, "not_tested"), origins.get(1, "not_tested")]
-    conflicts = sum(1 for origin in target_origins if origin == "conflicting")
-    return votes, origins, len(known), conflicts, parent_statuses
 
 
 def insertion_after(aligned_pairs, pair_index, read):
@@ -268,6 +173,56 @@ def read_fragments(bam_path, reference, variants, start, end, min_mapq, min_base
     return {name: {i: c for i, c in calls.items() if c is not None} for name, calls in fragments.items()}
 
 
+def count_parent_variant(bam_path, reference, variant, args):
+    counts = {"ref": 0, "alt": 0}
+    if not bam_path:
+        counts["status"] = "missing"
+        return counts
+    if not os.path.exists(bam_path):
+        counts["status"] = "missing_file"
+        return counts
+    if is_cram(bam_path) and not reference:
+        counts["status"] = "missing_reference"
+        return counts
+    bam = pysam.AlignmentFile(bam_path, "rc" if is_cram(bam_path) else "rb", reference_filename=reference)
+    for read in bam.fetch(variant.chrom, max(0, variant.pos - 2), variant.pos + len(variant.ref) + 1):
+        if read.mapping_quality < args.min_mapq or read.is_secondary or read.is_supplementary or read.is_qcfail:
+            continue
+        if read.is_duplicate and not args.include_duplicates:
+            continue
+        call = call_variant(read, variant, args.min_baseq)
+        if call:
+            counts["alt" if call[0] else "ref"] += 1
+    bam.close()
+    depth = counts["ref"] + counts["alt"]
+    alt_frac = counts["alt"] / depth if depth else 0.0
+    counts["depth"] = depth
+    counts["alt_frac"] = round(alt_frac, 4)
+    if depth < args.min_parent_bam_depth:
+        counts["status"] = "low_depth"
+    elif counts["alt"] >= args.min_parent_bam_alt_depth and alt_frac >= args.min_parent_bam_alt_frac:
+        counts["status"] = "has_alt"
+    elif counts["alt"] <= args.max_parent_bam_alt_depth_for_ref and alt_frac <= args.max_parent_bam_alt_frac:
+        counts["status"] = "no_alt"
+    else:
+        counts["status"] = "ambiguous"
+    return counts
+
+def parent_bam_statuses(args, variants):
+    out = {"mother": {}, "father": {}}
+    for i, variant in enumerate(variants):
+        out["mother"][i] = count_parent_variant(args.mother_bam, args.reference, variant, args)
+        out["father"][i] = count_parent_variant(args.father_bam, args.reference, variant, args)
+    return out
+
+
+def parent_bam_origins(statuses):
+    origins = {}
+    for i in statuses["mother"]:
+        origins[i] = infer_origin(statuses["mother"][i]["status"], statuses["father"][i]["status"])
+    return origins
+
+
 def edge_votes(fragments):
     votes = defaultdict(lambda: [0.0, 0.0, 0])
     informative = 0
@@ -284,16 +239,6 @@ def edge_votes(fragments):
                 votes[(i, j)][relation] += weight
                 votes[(i, j)][2] += 1
     return votes, informative
-
-
-def merge_votes(*vote_sets):
-    merged = defaultdict(lambda: [0.0, 0.0, 0])
-    for votes in vote_sets:
-        for edge, values in votes.items():
-            merged[edge][0] += values[0]
-            merged[edge][1] += values[1]
-            merged[edge][2] += values[2]
-    return merged
 
 
 def best_path(votes, source, target, skip_edge=None):
@@ -322,17 +267,12 @@ def best_path(votes, source, target, skip_edge=None):
     return best.get((target, 0), (0.0, [])), best.get((target, 1), (0.0, []))
 
 
-def classify_pair(variants, fragments, trio_votes=None):
+def classify_pair(variants, fragments):
     read_votes, informative = edge_votes(fragments)
-    trio_votes = trio_votes or {}
-    votes = merge_votes(read_votes, trio_votes)
     direct_read = read_votes.get((0, 1), [0.0, 0.0, 0])
-    direct_trio = trio_votes.get((0, 1), [0.0, 0.0, 0])
-    direct = votes.get((0, 1), [0.0, 0.0, 0])
     read_cis_path, read_trans_path = best_path(read_votes, 0, 1, skip_edge=(0, 1))
-    cis_path, trans_path = best_path(votes, 0, 1, skip_edge=(0, 1))
-    direct_delta = direct[0] - direct[1]
-    path_delta = cis_path[0] - trans_path[0]
+    direct_delta = direct_read[0] - direct_read[1]
+    path_delta = read_cis_path[0] - read_trans_path[0]
     score = direct_delta + path_delta
     if abs(score) < 1.0:
         phase = "ambiguous"
@@ -344,15 +284,12 @@ def classify_pair(variants, fragments, trio_votes=None):
         "direct_cis_weight": round(direct_read[0], 3),
         "direct_trans_weight": round(direct_read[1], 3),
         "direct_fragments": direct_read[2],
-        "trio_direct_cis_weight": round(direct_trio[0], 3),
-        "trio_direct_trans_weight": round(direct_trio[1], 3),
-        "trio_score": round(direct_trio[0] - direct_trio[1], 3),
         "best_read_cis_path_score": round(read_cis_path[0], 3),
         "best_read_trans_path_score": round(read_trans_path[0], 3),
-        "best_cis_path_score": round(cis_path[0], 3),
-        "best_trans_path_score": round(trans_path[0], 3),
-        "best_cis_path": ",".join(variants[i].name for i in cis_path[1]),
-        "best_trans_path": ",".join(variants[i].name for i in trans_path[1]),
+        "best_cis_path_score": round(read_cis_path[0], 3),
+        "best_trans_path_score": round(read_trans_path[0], 3),
+        "best_cis_path": ",".join(variants[i].name for i in read_cis_path[1]),
+        "best_trans_path": ",".join(variants[i].name for i in read_trans_path[1]),
         "informative_fragments": informative,
         "called_fragments": sum(1 for calls in fragments.values() if calls),
     }
@@ -371,7 +308,7 @@ def write_fragment_evidence(path, variants, fragments):
             writer.writerow({"fragment": name, "n_variants": len(calls), "calls": call_text})
 
 
-def add_metadata(result, args, variant1, variant2, span_start, span_end, origins, trio_informative, trio_conflicts, parent_statuses, bridge_count, method, status):
+def add_metadata(result, args, variant1, variant2, span_start, span_end, origins, bridge_count, method):
     variant1_origin = origins.get(0, "not_tested")
     variant2_origin = origins.get(1, "not_tested")
     result.update(
@@ -382,23 +319,42 @@ def add_metadata(result, args, variant1, variant2, span_start, span_end, origins
             "bam": args.bam,
             "vcf": args.vcf or "",
             "sample": args.sample or "",
-            "father_vcf": args.father_vcf or "",
-            "mother_vcf": args.mother_vcf or "",
-            "father_sample": args.father_sample or "",
-            "mother_sample": args.mother_sample or "",
             "variant1_origin": variant1_origin,
             "variant2_origin": variant2_origin,
-            "variant1_mother_status": parent_statuses["mother"].get(0, "not_tested"),
-            "variant1_father_status": parent_statuses["father"].get(0, "not_tested"),
-            "variant2_mother_status": parent_statuses["mother"].get(1, "not_tested"),
-            "variant2_father_status": parent_statuses["father"].get(1, "not_tested"),
-            "trio_phase": trio_phase_from_origins(variant1_origin, variant2_origin),
-            "trio_informative_variants": trio_informative,
-            "trio_conflicts": trio_conflicts,
-            "trio_status": status,
-            "absent_parent_record": args.absent_parent_record,
             "bridge_variants": bridge_count,
             "method": method,
+        }
+    )
+    return result
+
+
+def empty_parent_bam_statuses():
+    blank = {"status": "not_tested", "ref": 0, "alt": 0, "depth": 0, "alt_frac": 0.0}
+    return {"mother": {0: dict(blank), 1: dict(blank)}, "father": {0: dict(blank), 1: dict(blank)}}
+
+
+def add_parent_bam_metadata(result, args, statuses, phase):
+    result.update(
+        {
+            "father_bam": args.father_bam or "",
+            "mother_bam": args.mother_bam or "",
+            "parent_bam_phase": phase,
+            "variant1_mother_bam_status": statuses["mother"][0]["status"],
+            "variant1_mother_bam_ref_depth": statuses["mother"][0].get("ref", 0),
+            "variant1_mother_bam_alt_depth": statuses["mother"][0].get("alt", 0),
+            "variant1_mother_bam_alt_frac": statuses["mother"][0].get("alt_frac", 0.0),
+            "variant1_father_bam_status": statuses["father"][0]["status"],
+            "variant1_father_bam_ref_depth": statuses["father"][0].get("ref", 0),
+            "variant1_father_bam_alt_depth": statuses["father"][0].get("alt", 0),
+            "variant1_father_bam_alt_frac": statuses["father"][0].get("alt_frac", 0.0),
+            "variant2_mother_bam_status": statuses["mother"][1]["status"],
+            "variant2_mother_bam_ref_depth": statuses["mother"][1].get("ref", 0),
+            "variant2_mother_bam_alt_depth": statuses["mother"][1].get("alt", 0),
+            "variant2_mother_bam_alt_frac": statuses["mother"][1].get("alt_frac", 0.0),
+            "variant2_father_bam_status": statuses["father"][1]["status"],
+            "variant2_father_bam_ref_depth": statuses["father"][1].get("ref", 0),
+            "variant2_father_bam_alt_depth": statuses["father"][1].get("alt", 0),
+            "variant2_father_bam_alt_frac": statuses["father"][1].get("alt_frac", 0.0),
         }
     )
     return result
@@ -407,26 +363,32 @@ def add_metadata(result, args, variant1, variant2, span_start, span_end, origins
 def phase_one(args, variant1, variant2):
     if variant1.chrom != variant2.chrom:
         raise ValueError("Both variants must be on the same chromosome")
+    if not args.bam:
+        raise ValueError("Provide --bam or a bam column in --pairs-tsv for proband read-backed phasing")
     targets = [variant1, variant2]
     span_start = min(variant1.pos, variant2.pos) - args.window
     span_end = max(variant1.pos + len(variant1.ref), variant2.pos + len(variant2.ref)) + args.window
-
-    status = trio_status(args)
-    target_trio_votes, target_origins, target_trio_informative, target_trio_conflicts, target_parent_statuses = trio_edges(args, targets, variant1.chrom, span_start, span_end)
-    target_trio_phase = trio_phase_from_origins(target_origins.get(0, "not_tested"), target_origins.get(1, "not_tested"))
-    if target_trio_phase in {"cis", "trans"} and not args.always_run_reads:
-        result = classify_pair(targets, {}, target_trio_votes)
-        result["phase"] = target_trio_phase
-        return add_metadata(result, args, variant1, variant2, span_start, span_end, target_origins, target_trio_informative, target_trio_conflicts, target_parent_statuses, 0, "trio_first_pass", status), targets, {}
-
-    if not args.bam:
-        raise ValueError("Trio first pass was not informative; provide --bam or a bam column in --pairs-tsv for read-backed phasing")
     bridges = load_bridge_variants(args.vcf, args.sample, variant1.chrom, span_start, span_end, targets, args.max_bridges)
     variants = targets + sorted(bridges, key=lambda v: v.pos)
-    trio_vote_set, origins, trio_informative, trio_conflicts, parent_statuses = trio_edges(args, variants, variant1.chrom, span_start, span_end)
     fragments = read_fragments(args.bam, args.reference, variants, span_start, span_end, args.min_mapq, args.min_baseq, args.include_duplicates)
-    result = classify_pair(variants, fragments, trio_vote_set)
-    result = add_metadata(result, args, variant1, variant2, span_start, span_end, origins, trio_informative, trio_conflicts, parent_statuses, len(bridges), "read_backed", status)
+    result = classify_pair(variants, fragments)
+    origins = {i: "not_tested" for i in range(len(variants))}
+    method = "read_backed"
+    parent_bam = empty_parent_bam_statuses()
+    parent_bam_phase = "not_tested"
+    if result["phase"] == "ambiguous":
+        parent_bam = parent_bam_statuses(args, targets)
+        origins.update(parent_bam_origins(parent_bam))
+        parent_phase = phase_from_origins(origins.get(0, "not_tested"), origins.get(1, "not_tested"))
+        parent_bam_phase = parent_phase
+        if parent_phase in {"cis", "trans"}:
+            result["phase"] = parent_phase
+            result["score"] = args.parent_bam_weight if parent_phase == "cis" else -args.parent_bam_weight
+            method = "parent_bam_rescue"
+        else:
+            method = "read_backed_parent_bam_uninformative"
+    result = add_metadata(result, args, variant1, variant2, span_start, span_end, origins, len(bridges), method)
+    result = add_parent_bam_metadata(result, args, parent_bam, parent_bam_phase)
     return result, variants, fragments
 
 
@@ -462,10 +424,8 @@ def pair_rows(args):
                 row_args.bam = row_value(row, "bam", args.bam)
                 row_args.vcf = row_value(row, "vcf", args.vcf)
                 row_args.sample = row_value(row, "sample", args.sample)
-                row_args.father_vcf = row_value(row, "father_vcf", args.father_vcf, missing_overrides=True)
-                row_args.mother_vcf = row_value(row, "mother_vcf", args.mother_vcf, missing_overrides=True)
-                row_args.father_sample = row_value(row, "father_sample", args.father_sample, missing_overrides=True)
-                row_args.mother_sample = row_value(row, "mother_sample", args.mother_sample, missing_overrides=True)
+                row_args.father_bam = row_value(row, "father_bam", args.father_bam, missing_overrides=True)
+                row_args.mother_bam = row_value(row, "mother_bam", args.mother_bam, missing_overrides=True)
                 yield (
                     row_index,
                     row_args,
@@ -486,22 +446,21 @@ def init_worker():
 def main():
     global pysam
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bam", help="Coordinate-sorted, indexed BAM or CRAM; required when trio first pass is uninformative")
+    parser.add_argument("--bam", help="Coordinate-sorted, indexed proband BAM or CRAM; required unless pairs TSV has bam")
     parser.add_argument("--reference", help="Shared reference FASTA; required for CRAM and recommended for indels")
     parser.add_argument("--variant1", help="First target as chrom:pos:ref:alt")
     parser.add_argument("--variant2", help="Second target as chrom:pos:ref:alt")
     parser.add_argument("--pairs-tsv", help="Batch TSV with target variants and optional sample/proband/parent input columns")
     parser.add_argument("--vcf", help="Optional indexed VCF/BCF of nearby heterozygous bridge variants; can be overridden per batch row")
     parser.add_argument("--sample", help="Sample name in VCF; can be overridden per batch row; defaults to first sample")
-    parser.add_argument("--father-vcf", help="Optional father VCF/BCF for trio phasing; can be overridden per batch row")
-    parser.add_argument("--mother-vcf", help="Optional mother VCF/BCF for trio phasing; can be overridden per batch row")
-    parser.add_argument("--father-sample", help="Father sample name; can be overridden per batch row; defaults to first sample")
-    parser.add_argument("--mother-sample", help="Mother sample name; can be overridden per batch row; defaults to first sample")
-    parser.add_argument("--trio-weight", type=float, default=10.0, help="Weight added by each informative trio relationship")
-    parser.add_argument("--min-parent-gq", type=float, default=20.0, help="Minimum parent GQ when present")
-    parser.add_argument("--min-parent-dp", type=float, default=8.0, help="Minimum parent DP when present")
-    parser.add_argument("--absent-parent-record", choices=["no_alt", "missing"], default="no_alt", help="Interpretation of absent sites in parent VCFs")
-    parser.add_argument("--always-run-reads", action="store_true", help="Run proband read-backed phasing even when target trio phasing is clear")
+    parser.add_argument("--father-bam", help="Optional father BAM/CRAM for parent-BAM rescue; can be overridden per batch row")
+    parser.add_argument("--mother-bam", help="Optional mother BAM/CRAM for parent-BAM rescue; can be overridden per batch row")
+    parser.add_argument("--min-parent-bam-depth", type=int, default=8, help="Minimum parent BAM depth to call no_alt or has_alt")
+    parser.add_argument("--min-parent-bam-alt-depth", type=int, default=3, help="Minimum ALT-supporting parent reads for has_alt")
+    parser.add_argument("--min-parent-bam-alt-frac", type=float, default=0.2, help="Minimum parent ALT read fraction for has_alt")
+    parser.add_argument("--max-parent-bam-alt-depth-for-ref", type=int, default=1, help="Maximum ALT-supporting parent reads for no_alt")
+    parser.add_argument("--max-parent-bam-alt-frac-for-ref", type=float, default=0.05, help="Maximum parent ALT read fraction for no_alt")
+    parser.add_argument("--parent-bam-weight", type=float, default=10.0, help="Score assigned when parent BAM rescue phases the target pair")
     parser.add_argument("--window", type=int, default=1000, help="Bases to fetch around target pair")
     parser.add_argument("--max-bridges", type=int, default=200, help="Maximum nearby heterozygous variants to use")
     parser.add_argument("--min-mapq", type=int, default=20)

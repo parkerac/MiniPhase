@@ -24,8 +24,8 @@ python3 phasing/scripts/phase_nearby_variants.py \
   --variant2 chr1:100120:C:T \
   --vcf sample.vcf.gz \
   --sample SAMPLE_ID \
-  --father-vcf father.vcf.gz \
-  --mother-vcf mother.vcf.gz \
+  --father-bam father.bam \
+  --mother-bam mother.bam \
   --out phase_result.tsv \
   --evidence phase_fragments.tsv \
   --json phase_result.json
@@ -53,63 +53,50 @@ The batch TSV must contain:
 chrom	pos1	ref1	alt1	pos2	ref2	alt2
 ```
 
-It can also contain sample-specific input columns. The `bam` column can contain BAM or CRAM paths.
+It can also contain sample-specific input columns. The `bam`, `father_bam`, and `mother_bam` columns can contain BAM or CRAM paths.
 
 ```text
-chrom	pos1	ref1	alt1	pos2	ref2	alt2	bam	vcf	sample	father_vcf	mother_vcf	father_sample	mother_sample
-chr1	100000	A	G	100120	C	T	sample1.bam	sample1.vcf.gz	SAMPLE1	father1.vcf.gz	mother1.vcf.gz	FATHER1	MOTHER1
-chr1	200000	G	A	200180	T	C	sample2.cram	sample2.vcf.gz	SAMPLE2	father2.vcf.gz	mother2.vcf.gz	FATHER2	MOTHER2
-chr1	300000	C	A	300150	G	T	sample3.bam	sample3.vcf.gz	SAMPLE3	NA	NA	NA	NA
+chrom	pos1	ref1	alt1	pos2	ref2	alt2	bam	vcf	sample	father_bam	mother_bam
+chr1	100000	A	G	100120	C	T	sample1.bam	sample1.vcf.gz	SAMPLE1	father1.bam	mother1.bam
+chr1	200000	G	A	200180	T	C	sample2.cram	sample2.vcf.gz	SAMPLE2	father2.cram	mother2.cram
+chr1	300000	C	A	300150	G	T	sample3.bam	sample3.vcf.gz	SAMPLE3	NA	NA
 ```
 
-`bam`, `vcf`, `sample`, `father_vcf`, `mother_vcf`, `father_sample`, and `mother_sample` columns override the matching command-line values for that row. This means you can provide common defaults globally and only include columns that vary by sample. `--reference` is shared across all rows and is required when any alignment file is CRAM.
+`bam`, `vcf`, `sample`, `father_bam`, and `mother_bam` columns override the matching command-line values for that row. This means you can provide common defaults globally and only include columns that vary by sample. `--reference` is shared across all rows and is required when any alignment file is CRAM.
 
-Parent columns can use `NA`, `N/A`, `.`, `None`, `null`, or an empty value when parent data is unavailable for a sample. Those rows skip trio first-pass phasing and use read-backed phasing.
+Parent BAM columns can use `NA`, `N/A`, `.`, `None`, `null`, or an empty value when parent data is unavailable for a sample. Those rows still run proband read-backed phasing.
 
-## Trio VCF Phasing
+## Phasing Order
 
-Trio evidence is VCF-only and optional. Provide both parent VCFs to enable it:
+The script first tries proband read-backed phasing using direct overlapping reads, paired-end fragments, and optional nearby heterozygous bridge variants from the proband VCF.
+
+If the proband read-backed result is `ambiguous`, the script optionally checks parent BAM/CRAM files at the two target variants only:
 
 ```bash
 python3 phasing/scripts/phase_nearby_variants.py \
   --reference GRCh38.fa \
   --pairs-tsv variant_pairs.tsv \
-  --father-vcf father.vcf.gz \
-  --mother-vcf mother.vcf.gz \
+  --father-bam father.bam \
+  --mother-bam mother.bam \
   --threads 8 \
   --out phase_results.tsv
 ```
 
-The script labels a proband ALT allele as `maternal` when the mother carries the ALT and the father is homozygous reference, and as `paternal` for the reverse.
+Parent BAM rescue labels a proband ALT allele as `maternal` when the mother has ALT-supporting reads and the father is consistent with reference, and as `paternal` for the reverse. If both target origins are clear, the final `phase` is rescued as `cis` or `trans`.
 
-By default, target-variant trio phasing is the first pass. If both target variants have clear parental origins, the script reports `phase` from trio evidence and does not open the proband BAM/CRAM. If trio evidence is not informative, it falls back to read-backed phasing and can still use trio-labeled bridge variants in the local graph.
-
-`bam` is required only when trio first-pass phasing is uninformative or when `--always-run-reads` is used.
-
-For sample-specific variant-only parent VCFs, sites absent from a parent VCF are interpreted as `no_alt` by default. This is usually what you want when parent VCFs only contain called variants. Use `--absent-parent-record missing` for gVCF-like or sparse files where absence should not be treated as homozygous reference.
-
-If a parent VCF input itself is missing, for example `NA` in `father_vcf` or `mother_vcf`, the corresponding parent status columns report `missing`. If a parent VCF path is provided and the file exists but has no matching record for a target variant, the parent status reports `no_alt` by default.
-
-Trio-specific output columns include `trio_phase`, `trio_score`, `variant1_origin`, `variant2_origin`, `variant1_mother_status`, `variant1_father_status`, `variant2_mother_status`, `variant2_father_status`, `trio_informative_variants`, `trio_conflicts`, and `trio_status`. The `method` column reports `trio_first_pass` when the proband alignment was skipped and `read_backed` when read-backed phasing was run.
-
-`trio_status` values:
+Useful parent BAM rescue options:
 
 ```text
-available
-missing_parent_vcf
-missing_parent_file
-disabled
+--min-parent-bam-depth 8
+--min-parent-bam-alt-depth 3
+--min-parent-bam-alt-frac 0.2
+--max-parent-bam-alt-depth-for-ref 1
+--max-parent-bam-alt-frac-for-ref 0.05
 ```
 
-Useful trio options:
+The `method` column reports `read_backed`, `parent_bam_rescue`, or `read_backed_parent_bam_uninformative`.
 
-```text
---trio-weight 10
---min-parent-gq 20
---min-parent-dp 8
---absent-parent-record no_alt
---always-run-reads
-```
+Parent-BAM-specific output columns include `parent_bam_phase`, `variant1_mother_bam_status`, `variant1_father_bam_status`, `variant2_mother_bam_status`, `variant2_father_bam_status`, and matching REF/ALT depth and ALT fraction columns. Parent BAM statuses are `has_alt`, `no_alt`, `low_depth`, `ambiguous`, `missing`, `missing_file`, or `missing_reference`.
 
 `--threads` controls the number of worker processes. Output row order matches the input TSV order.
 
