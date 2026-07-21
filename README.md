@@ -86,7 +86,11 @@ By default, target-variant trio phasing is the first pass. If both target varian
 
 `bam` is required only when trio first-pass phasing is uninformative or when `--always-run-reads` is used.
 
-Trio-specific output columns include `trio_phase`, `trio_score`, `variant1_origin`, `variant2_origin`, `trio_informative_variants`, `trio_conflicts`, and `trio_status`. The `method` column reports `trio_first_pass` when the proband alignment was skipped and `read_backed` when read-backed phasing was run.
+For sample-specific variant-only parent VCFs, sites absent from a parent VCF are interpreted as `no_alt` by default. This is usually what you want when parent VCFs only contain called variants. Use `--absent-parent-record missing` for gVCF-like or sparse files where absence should not be treated as homozygous reference.
+
+If a parent VCF input itself is missing, for example `NA` in `father_vcf` or `mother_vcf`, the corresponding parent status columns report `missing`. If a parent VCF path is provided and the file exists but has no matching record for a target variant, the parent status reports `no_alt` by default.
+
+Trio-specific output columns include `trio_phase`, `trio_score`, `variant1_origin`, `variant2_origin`, `variant1_mother_status`, `variant1_father_status`, `variant2_mother_status`, `variant2_father_status`, `trio_informative_variants`, `trio_conflicts`, and `trio_status`. The `method` column reports `trio_first_pass` when the proband alignment was skipped and `read_backed` when read-backed phasing was run.
 
 `trio_status` values:
 
@@ -103,6 +107,7 @@ Useful trio options:
 --trio-weight 10
 --min-parent-gq 20
 --min-parent-dp 8
+--absent-parent-record no_alt
 --always-run-reads
 ```
 

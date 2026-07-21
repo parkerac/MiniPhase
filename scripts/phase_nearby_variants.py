@@ -84,8 +84,8 @@ def load_bridge_variants(vcf_path, sample, chrom, start, end, targets, max_bridg
     return variants
 
 
-def load_parent_statuses(vcf_path, sample, chrom, start, end, variants, min_gq, min_dp):
-    statuses = {i: "missing" for i in range(len(variants))}
+def load_parent_statuses(vcf_path, sample, chrom, start, end, variants, min_gq, min_dp, absent_status):
+    statuses = {i: absent_status for i in range(len(variants))}
     if not vcf_path:
         return statuses, sample or ""
     wanted = {(v.chrom, v.pos, v.ref, v.alt): i for i, v in enumerate(variants)}
@@ -135,13 +135,38 @@ def trio_status(args):
     return "available"
 
 
+def initial_parent_statuses(args, n_variants):
+    statuses = {
+        "mother": {i: "not_tested" for i in range(n_variants)},
+        "father": {i: "not_tested" for i in range(n_variants)},
+    }
+    if not args.mother_vcf:
+        statuses["mother"] = {i: "missing" for i in range(n_variants)}
+    elif not os.path.exists(args.mother_vcf):
+        statuses["mother"] = {i: "missing_file" for i in range(n_variants)}
+    if not args.father_vcf:
+        statuses["father"] = {i: "missing" for i in range(n_variants)}
+    elif not os.path.exists(args.father_vcf):
+        statuses["father"] = {i: "missing_file" for i in range(n_variants)}
+    return statuses
+
+
 def trio_edges(args, variants, chrom, start, end):
     votes = defaultdict(lambda: [0.0, 0.0, 0])
     origins = {i: "not_tested" for i in range(len(variants))}
-    if trio_status(args) != "available":
-        return votes, origins, 0, 0
-    mother, mother_sample = load_parent_statuses(args.mother_vcf, args.mother_sample, chrom, start, end, variants, args.min_parent_gq, args.min_parent_dp)
-    father, father_sample = load_parent_statuses(args.father_vcf, args.father_sample, chrom, start, end, variants, args.min_parent_gq, args.min_parent_dp)
+    parent_statuses = initial_parent_statuses(args, len(variants))
+    status = trio_status(args)
+    if status == "disabled":
+        return votes, origins, 0, 0, parent_statuses
+    if status != "available":
+        if args.mother_vcf and os.path.exists(args.mother_vcf):
+            parent_statuses["mother"], args.mother_sample = load_parent_statuses(args.mother_vcf, args.mother_sample, chrom, start, end, variants, args.min_parent_gq, args.min_parent_dp, args.absent_parent_record)
+        if args.father_vcf and os.path.exists(args.father_vcf):
+            parent_statuses["father"], args.father_sample = load_parent_statuses(args.father_vcf, args.father_sample, chrom, start, end, variants, args.min_parent_gq, args.min_parent_dp, args.absent_parent_record)
+        return votes, origins, 0, 0, parent_statuses
+    mother, mother_sample = load_parent_statuses(args.mother_vcf, args.mother_sample, chrom, start, end, variants, args.min_parent_gq, args.min_parent_dp, args.absent_parent_record)
+    father, father_sample = load_parent_statuses(args.father_vcf, args.father_sample, chrom, start, end, variants, args.min_parent_gq, args.min_parent_dp, args.absent_parent_record)
+    parent_statuses = {"mother": mother, "father": father}
     args.mother_sample = mother_sample
     args.father_sample = father_sample
     for i in range(len(variants)):
@@ -155,7 +180,7 @@ def trio_edges(args, variants, chrom, start, end):
             votes[(i, j)][2] += 1
     target_origins = [origins.get(0, "not_tested"), origins.get(1, "not_tested")]
     conflicts = sum(1 for origin in target_origins if origin == "conflicting")
-    return votes, origins, len(known), conflicts
+    return votes, origins, len(known), conflicts, parent_statuses
 
 
 def insertion_after(aligned_pairs, pair_index, read):
@@ -346,7 +371,7 @@ def write_fragment_evidence(path, variants, fragments):
             writer.writerow({"fragment": name, "n_variants": len(calls), "calls": call_text})
 
 
-def add_metadata(result, args, variant1, variant2, span_start, span_end, origins, trio_informative, trio_conflicts, bridge_count, method, status):
+def add_metadata(result, args, variant1, variant2, span_start, span_end, origins, trio_informative, trio_conflicts, parent_statuses, bridge_count, method, status):
     variant1_origin = origins.get(0, "not_tested")
     variant2_origin = origins.get(1, "not_tested")
     result.update(
@@ -363,10 +388,15 @@ def add_metadata(result, args, variant1, variant2, span_start, span_end, origins
             "mother_sample": args.mother_sample or "",
             "variant1_origin": variant1_origin,
             "variant2_origin": variant2_origin,
+            "variant1_mother_status": parent_statuses["mother"].get(0, "not_tested"),
+            "variant1_father_status": parent_statuses["father"].get(0, "not_tested"),
+            "variant2_mother_status": parent_statuses["mother"].get(1, "not_tested"),
+            "variant2_father_status": parent_statuses["father"].get(1, "not_tested"),
             "trio_phase": trio_phase_from_origins(variant1_origin, variant2_origin),
             "trio_informative_variants": trio_informative,
             "trio_conflicts": trio_conflicts,
             "trio_status": status,
+            "absent_parent_record": args.absent_parent_record,
             "bridge_variants": bridge_count,
             "method": method,
         }
@@ -382,21 +412,21 @@ def phase_one(args, variant1, variant2):
     span_end = max(variant1.pos + len(variant1.ref), variant2.pos + len(variant2.ref)) + args.window
 
     status = trio_status(args)
-    target_trio_votes, target_origins, target_trio_informative, target_trio_conflicts = trio_edges(args, targets, variant1.chrom, span_start, span_end)
+    target_trio_votes, target_origins, target_trio_informative, target_trio_conflicts, target_parent_statuses = trio_edges(args, targets, variant1.chrom, span_start, span_end)
     target_trio_phase = trio_phase_from_origins(target_origins.get(0, "not_tested"), target_origins.get(1, "not_tested"))
     if target_trio_phase in {"cis", "trans"} and not args.always_run_reads:
         result = classify_pair(targets, {}, target_trio_votes)
         result["phase"] = target_trio_phase
-        return add_metadata(result, args, variant1, variant2, span_start, span_end, target_origins, target_trio_informative, target_trio_conflicts, 0, "trio_first_pass", status), targets, {}
+        return add_metadata(result, args, variant1, variant2, span_start, span_end, target_origins, target_trio_informative, target_trio_conflicts, target_parent_statuses, 0, "trio_first_pass", status), targets, {}
 
     if not args.bam:
         raise ValueError("Trio first pass was not informative; provide --bam or a bam column in --pairs-tsv for read-backed phasing")
     bridges = load_bridge_variants(args.vcf, args.sample, variant1.chrom, span_start, span_end, targets, args.max_bridges)
     variants = targets + sorted(bridges, key=lambda v: v.pos)
-    trio_vote_set, origins, trio_informative, trio_conflicts = trio_edges(args, variants, variant1.chrom, span_start, span_end)
+    trio_vote_set, origins, trio_informative, trio_conflicts, parent_statuses = trio_edges(args, variants, variant1.chrom, span_start, span_end)
     fragments = read_fragments(args.bam, args.reference, variants, span_start, span_end, args.min_mapq, args.min_baseq, args.include_duplicates)
     result = classify_pair(variants, fragments, trio_vote_set)
-    result = add_metadata(result, args, variant1, variant2, span_start, span_end, origins, trio_informative, trio_conflicts, len(bridges), "read_backed", status)
+    result = add_metadata(result, args, variant1, variant2, span_start, span_end, origins, trio_informative, trio_conflicts, parent_statuses, len(bridges), "read_backed", status)
     return result, variants, fragments
 
 
@@ -411,7 +441,10 @@ def row_value(row, key, default=None, missing_overrides=False):
     if key not in row:
         return default
     value = row.get(key)
-    if value is None or value.strip().upper() in MISSING_VALUES:
+    if value is None:
+        return None if missing_overrides else default
+    value = value.strip()
+    if value.upper() in MISSING_VALUES:
         return None if missing_overrides else default
     return value
 
@@ -467,6 +500,7 @@ def main():
     parser.add_argument("--trio-weight", type=float, default=10.0, help="Weight added by each informative trio relationship")
     parser.add_argument("--min-parent-gq", type=float, default=20.0, help="Minimum parent GQ when present")
     parser.add_argument("--min-parent-dp", type=float, default=8.0, help="Minimum parent DP when present")
+    parser.add_argument("--absent-parent-record", choices=["no_alt", "missing"], default="no_alt", help="Interpretation of absent sites in parent VCFs")
     parser.add_argument("--always-run-reads", action="store_true", help="Run proband read-backed phasing even when target trio phasing is clear")
     parser.add_argument("--window", type=int, default=1000, help="Bases to fetch around target pair")
     parser.add_argument("--max-bridges", type=int, default=200, help="Maximum nearby heterozygous variants to use")
