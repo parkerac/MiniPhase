@@ -56,13 +56,15 @@ chrom	pos1	ref1	alt1	pos2	ref2	alt2
 It can also contain sample-specific input columns. The `bam`, `father_bam`, and `mother_bam` columns can contain BAM or CRAM paths.
 
 ```text
-chrom	pos1	ref1	alt1	pos2	ref2	alt2	bam	vcf	sample	father_bam	mother_bam
-chr1	100000	A	G	100120	C	T	sample1.bam	sample1.vcf.gz	SAMPLE1	father1.bam	mother1.bam
-chr1	200000	G	A	200180	T	C	sample2.cram	sample2.vcf.gz	SAMPLE2	father2.cram	mother2.cram
-chr1	300000	C	A	300150	G	T	sample3.bam	sample3.vcf.gz	SAMPLE3	NA	NA
+chrom	pos1	ref1	alt1	pos2	ref2	alt2	bam	reference	vcf	sample	father_bam	mother_bam
+chr1	100000	A	G	100120	C	T	sample1.bam	GRCh38.fa	sample1.vcf.gz	SAMPLE1	father1.bam	mother1.bam
+chr1	200000	G	A	200180	T	C	sample2.cram	sample2.fa	sample2.vcf.gz	SAMPLE2	father2.cram	mother2.cram
+chr1	300000	C	A	300150	G	T	sample3.bam	GRCh38.fa	sample3.vcf.gz	SAMPLE3	NA	NA
 ```
 
-`bam`, `vcf`, `sample`, `father_bam`, and `mother_bam` columns override the matching command-line values for that row. This means you can provide common defaults globally and only include columns that vary by sample. `--reference` is shared across all rows and is required when any alignment file is CRAM.
+`bam`, `reference`, `vcf`, `sample`, `father_bam`, and `mother_bam` columns override the matching command-line values for that row. This means you can provide common defaults globally and only include columns that vary by sample. A reference FASTA is required for CRAM inputs and recommended for indels.
+
+Reference paths are canonicalized internally. In batch mode, rows are grouped by reference for processing and then written back in the original input order. Each worker process keeps one open FASTA handle per reference path, which helps avoid repeated reference setup when many rows share the same FASTA.
 
 Parent BAM columns can use `NA`, `N/A`, `.`, `None`, `null`, or an empty value when parent data is unavailable for a sample. Those rows still run proband read-backed phasing.
 

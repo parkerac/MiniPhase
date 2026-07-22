@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 pysam = None
 MISSING_VALUES = {"", ".", "NA", "N/A", "NONE", "NULL", "NAN"}
+REFERENCE_CACHE = {}
 
 
 @dataclass(frozen=True)
@@ -152,10 +153,23 @@ def is_cram(path):
     return path.lower().endswith(".cram")
 
 
+def cached_reference(reference):
+    if not reference:
+        return None
+    reference = os.path.realpath(reference)
+    if reference not in REFERENCE_CACHE and pysam is not None:
+        try:
+            REFERENCE_CACHE[reference] = pysam.FastaFile(reference)
+        except Exception:
+            REFERENCE_CACHE[reference] = None
+    return reference
+
+
 def read_fragments(bam_path, reference, variants, start, end, min_mapq, min_baseq, include_duplicates):
     fragments = defaultdict(dict)
     if is_cram(bam_path) and not reference:
         raise ValueError(f"{bam_path} is a CRAM; provide the shared reference with --reference")
+    reference = cached_reference(reference)
     bam = pysam.AlignmentFile(bam_path, "rc" if is_cram(bam_path) else "rb", reference_filename=reference)
     for read in bam.fetch(variants[0].chrom, max(0, start - 1), end):
         if read.mapping_quality < min_mapq or read.is_secondary or read.is_supplementary or read.is_qcfail:
@@ -184,6 +198,7 @@ def count_parent_variant(bam_path, reference, variant, args):
     if is_cram(bam_path) and not reference:
         counts["status"] = "missing_reference"
         return counts
+    reference = cached_reference(reference)
     bam = pysam.AlignmentFile(bam_path, "rc" if is_cram(bam_path) else "rb", reference_filename=reference)
     for read in bam.fetch(variant.chrom, max(0, variant.pos - 2), variant.pos + len(variant.ref) + 1):
         if read.mapping_quality < args.min_mapq or read.is_secondary or read.is_supplementary or read.is_qcfail:
@@ -318,6 +333,7 @@ def add_metadata(result, args, variant1, variant2, span_start, span_end, origins
             "variant2": f"{variant2.chrom}:{variant2.pos}:{variant2.ref}:{variant2.alt}",
             "region": f"{variant1.chrom}:{max(1, span_start)}-{span_end}",
             "bam": args.bam,
+            "reference": args.reference or "",
             "vcf": args.vcf or "",
             "sample": args.sample or "",
             "variant1_origin": variant1_origin,
@@ -423,6 +439,7 @@ def pair_rows(args):
             for row_index, row in enumerate(reader, start=1):
                 row_args = argparse.Namespace(**vars(args))
                 row_args.bam = row_value(row, "bam", args.bam)
+                row_args.reference = row_value(row, "reference", args.reference)
                 row_args.vcf = row_value(row, "vcf", args.vcf)
                 row_args.sample = row_value(row, "sample", args.sample)
                 row_args.father_bam = row_value(row, "father_bam", args.father_bam, missing_overrides=True)
@@ -438,17 +455,23 @@ def pair_rows(args):
 
 
 def init_worker():
-    global pysam
+    global pysam, REFERENCE_CACHE
     import pysam as pysam_module
 
     pysam = pysam_module
+    REFERENCE_CACHE = {}
+
+
+def job_reference_key(job):
+    _, row_args, _, _ = job
+    return os.path.realpath(row_args.reference) if row_args.reference else ""
 
 
 def main():
     global pysam
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bam", help="Coordinate-sorted, indexed proband BAM or CRAM; required unless pairs TSV has bam")
-    parser.add_argument("--reference", help="Shared reference FASTA; required for CRAM and recommended for indels")
+    parser.add_argument("--reference", help="Reference FASTA; required for CRAM and recommended for indels; can be overridden per batch row")
     parser.add_argument("--variant1", help="First target as chrom:pos:ref:alt")
     parser.add_argument("--variant2", help="Second target as chrom:pos:ref:alt")
     parser.add_argument("--pairs-tsv", help="Batch TSV with target variants and optional sample/proband/parent input columns")
@@ -492,6 +515,8 @@ def main():
     rows = []
     last = None
     jobs = list(pair_rows(args))
+    if args.pairs_tsv:
+        jobs = sorted(jobs, key=job_reference_key)
     if args.pairs_tsv and args.threads > 1:
         with mp.Pool(args.threads, initializer=init_worker) as pool:
             rows = list(pool.imap(phase_one_row, jobs, chunksize=args.chunksize))
@@ -501,6 +526,8 @@ def main():
             result["row_index"] = row_index
             rows.append(result)
             last = result, variants, fragments
+    if args.pairs_tsv:
+        rows.sort(key=lambda row: row["row_index"])
 
     with open(args.out, "w", newline="") as fh:
         fieldnames = list(rows[0].keys()) if rows else []
