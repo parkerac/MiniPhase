@@ -42,7 +42,25 @@ def parse_gt(gt):
 
 
 def same_variant(a, b):
-    return a.chrom == b.chrom and a.pos == b.pos and a.ref == b.ref and a.alt == b.alt
+    return b.chrom in contig_aliases(a.chrom) and a.pos == b.pos and a.ref == b.ref and a.alt == b.alt
+
+
+def contig_aliases(chrom):
+    aliases = [chrom]
+    aliases.append(chrom[3:] if chrom.startswith("chr") else f"chr{chrom}")
+    if chrom in {"M", "MT", "chrM", "chrMT"}:
+        aliases.extend(["M", "MT", "chrM", "chrMT"])
+    return list(dict.fromkeys(aliases))
+
+
+def resolve_contig(handle, chrom):
+    references = set(getattr(handle, "references", ()) or getattr(handle.header, "references", ()) or [])
+    if not references and hasattr(handle, "header") and hasattr(handle.header, "contigs"):
+        references = set(handle.header.contigs)
+    for alias in contig_aliases(chrom):
+        if not references or alias in references:
+            return alias
+    raise ValueError(f"Contig {chrom} was not found in input header; tried {', '.join(contig_aliases(chrom))}")
 
 
 def load_bridge_variants(vcf_path, sample, chrom, start, end, targets, max_bridges):
@@ -53,7 +71,7 @@ def load_bridge_variants(vcf_path, sample, chrom, start, end, targets, max_bridg
         sample = sample or next(iter(vcf.header.samples), None)
         if not sample:
             raise ValueError("VCF has no samples; provide targets only or a genotyped VCF")
-        for rec in vcf.fetch(chrom, max(0, start - 1), end):
+        for rec in vcf.fetch(resolve_contig(vcf, chrom), max(0, start - 1), end):
             if len(rec.ref) > 50 or len(rec.alts or []) != 1:
                 continue
             gt = parse_gt(rec.samples[sample].get("GT"))
@@ -171,7 +189,8 @@ def read_fragments(bam_path, reference, variants, start, end, min_mapq, min_base
         raise ValueError(f"{bam_path} is a CRAM; provide the shared reference with --reference")
     reference = cached_reference(reference)
     bam = pysam.AlignmentFile(bam_path, "rc" if is_cram(bam_path) else "rb", reference_filename=reference)
-    for read in bam.fetch(variants[0].chrom, max(0, start - 1), end):
+    fetch_chrom = resolve_contig(bam, variants[0].chrom)
+    for read in bam.fetch(fetch_chrom, max(0, start - 1), end):
         if read.mapping_quality < min_mapq or read.is_secondary or read.is_supplementary or read.is_qcfail:
             continue
         if read.is_duplicate and not include_duplicates:
@@ -200,7 +219,8 @@ def count_parent_variant(bam_path, reference, variant, args):
         return counts
     reference = cached_reference(reference)
     bam = pysam.AlignmentFile(bam_path, "rc" if is_cram(bam_path) else "rb", reference_filename=reference)
-    for read in bam.fetch(variant.chrom, max(0, variant.pos - 2), variant.pos + len(variant.ref) + 1):
+    fetch_chrom = resolve_contig(bam, variant.chrom)
+    for read in bam.fetch(fetch_chrom, max(0, variant.pos - 2), variant.pos + len(variant.ref) + 1):
         if read.mapping_quality < args.min_mapq or read.is_secondary or read.is_supplementary or read.is_qcfail:
             continue
         if read.is_duplicate and not args.include_duplicates:
