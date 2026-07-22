@@ -72,12 +72,13 @@ def load_bridge_variants(vcf_path, sample, chrom, start, end, targets, max_bridg
         if not sample:
             raise ValueError("VCF has no samples; provide targets only or a genotyped VCF")
         for rec in vcf.fetch(resolve_contig(vcf, chrom), max(0, start - 1), end):
-            if len(rec.ref) > 50 or len(rec.alts or []) != 1:
+            real_alts = real_alt_indices(rec)
+            if len(rec.ref) > 50 or len(real_alts) != 1:
                 continue
             gt = parse_gt(rec.samples[sample].get("GT"))
-            if gt != {0, 1}:
+            alt, alt_index = next(iter(real_alts.items()))
+            if gt != {0, alt_index}:
                 continue
-            alt = rec.alts[0]
             variant = Variant(rec.chrom, rec.pos, rec.ref.upper(), alt.upper(), rec.id or f"{rec.chrom}:{rec.pos}:{rec.ref}>{alt}")
             if any(same_variant(variant, target) for target in targets):
                 continue
@@ -97,6 +98,71 @@ def infer_origin(mother_status, father_status):
     if mother_status == "no_alt" and father_status == "no_alt":
         return "conflicting"
     return "uninformative"
+
+
+def gt_alleles(rec, sample):
+    if not sample:
+        sample = next(iter(rec.samples), None)
+    if not sample or sample not in rec.samples:
+        return None
+    gt = rec.samples[sample].get("GT")
+    if gt is None or any(a is None for a in gt):
+        return None
+    return set(gt)
+
+
+def real_alt_indices(rec):
+    return {alt.upper(): i + 1 for i, alt in enumerate(rec.alts or []) if alt and not alt.startswith("<") and alt != "*"}
+
+
+def classify_parent_vcf_record(rec, variant, sample):
+    alleles = gt_alleles(rec, sample)
+    if alleles is None:
+        return "ambiguous"
+    if rec.pos == variant.pos and rec.ref.upper() == variant.ref and variant.alt in real_alt_indices(rec):
+        return "has_alt" if real_alt_indices(rec)[variant.alt] in alleles else "no_alt"
+    if rec.start <= variant.pos - 1 < rec.stop and alleles == {0}:
+        return "no_alt"
+    return "ambiguous" if any(a > 0 for a in alleles) else "no_alt"
+
+
+def count_parent_vcf_variant(vcf, sample, variant):
+    saw_record = False
+    try:
+        records = vcf.fetch(resolve_contig(vcf, variant.chrom), max(0, variant.pos - 1), variant.pos + len(variant.ref))
+    except ValueError:
+        return {"status": "no_record"}
+    for rec in records:
+        if not (rec.start <= variant.pos - 1 < rec.stop):
+            continue
+        saw_record = True
+        status = classify_parent_vcf_record(rec, variant, sample)
+        if status in {"has_alt", "no_alt"}:
+            return {"status": status}
+    return {"status": "ambiguous" if saw_record else "no_record"}
+
+
+def parent_vcf_statuses_for_path(vcf_path, sample, variants):
+    if not vcf_path:
+        return {i: {"status": "missing"} for i in range(len(variants))}
+    if not os.path.exists(vcf_path):
+        return {i: {"status": "missing_file"} for i in range(len(variants))}
+    with pysam.VariantFile(vcf_path) as vcf:
+        sample = sample or next(iter(vcf.header.samples), None)
+        if not sample or sample not in vcf.header.samples:
+            return {i: {"status": "missing_sample"} for i in range(len(variants))}
+        return {i: count_parent_vcf_variant(vcf, sample, variant) for i, variant in enumerate(variants)}
+
+
+def parent_vcf_statuses(args, variants):
+    return {
+        "mother": parent_vcf_statuses_for_path(args.mother_vcf, args.mother_sample, variants),
+        "father": parent_vcf_statuses_for_path(args.father_vcf, args.father_sample, variants),
+    }
+
+
+def parent_origins(statuses):
+    return {i: infer_origin(statuses["mother"][i]["status"], statuses["father"][i]["status"]) for i in statuses["mother"]}
 
 
 def phase_from_origins(origin1, origin2):
@@ -253,10 +319,7 @@ def parent_bam_statuses(args, variants):
 
 
 def parent_bam_origins(statuses):
-    origins = {}
-    for i in statuses["mother"]:
-        origins[i] = infer_origin(statuses["mother"][i]["status"], statuses["father"][i]["status"])
-    return origins
+    return parent_origins(statuses)
 
 
 def edge_votes(fragments):
@@ -370,6 +433,28 @@ def empty_parent_bam_statuses():
     return {"mother": {0: dict(blank), 1: dict(blank)}, "father": {0: dict(blank), 1: dict(blank)}}
 
 
+def empty_parent_vcf_statuses():
+    blank = {"status": "not_tested"}
+    return {"mother": {0: dict(blank), 1: dict(blank)}, "father": {0: dict(blank), 1: dict(blank)}}
+
+
+def add_parent_vcf_metadata(result, args, statuses, phase):
+    result.update(
+        {
+            "father_vcf": args.father_vcf or "",
+            "mother_vcf": args.mother_vcf or "",
+            "father_sample": args.father_sample or "",
+            "mother_sample": args.mother_sample or "",
+            "parent_vcf_phase": phase,
+            "variant1_mother_vcf_status": statuses["mother"][0]["status"],
+            "variant1_father_vcf_status": statuses["father"][0]["status"],
+            "variant2_mother_vcf_status": statuses["mother"][1]["status"],
+            "variant2_father_vcf_status": statuses["father"][1]["status"],
+        }
+    )
+    return result
+
+
 def add_parent_bam_metadata(result, args, statuses, phase):
     result.update(
         {
@@ -411,20 +496,35 @@ def phase_one(args, variant1, variant2):
     result = classify_pair(variants, fragments)
     origins = {i: "not_tested" for i in range(len(variants))}
     method = "read_backed"
+    parent_vcf = empty_parent_vcf_statuses()
+    parent_vcf_phase = "not_tested"
     parent_bam = empty_parent_bam_statuses()
     parent_bam_phase = "not_tested"
     if result["phase"] == "ambiguous":
-        parent_bam = parent_bam_statuses(args, targets)
-        origins.update(parent_bam_origins(parent_bam))
+        parent_vcf = parent_vcf_statuses(args, targets)
+        vcf_origins = parent_origins(parent_vcf)
+        origins.update(vcf_origins)
         parent_phase = phase_from_origins(origins.get(0, "not_tested"), origins.get(1, "not_tested"))
-        parent_bam_phase = parent_phase
+        parent_vcf_phase = parent_phase
         if parent_phase in {"cis", "trans"}:
             result["phase"] = parent_phase
-            result["score"] = args.parent_bam_weight if parent_phase == "cis" else -args.parent_bam_weight
-            method = "parent_bam_rescue"
+            result["score"] = args.parent_vcf_weight if parent_phase == "cis" else -args.parent_vcf_weight
+            method = "parent_vcf_rescue"
         else:
-            method = "read_backed_parent_bam_uninformative"
+            parent_bam = parent_bam_statuses(args, targets)
+            for i, origin in parent_bam_origins(parent_bam).items():
+                if vcf_origins.get(i) not in {"maternal", "paternal"}:
+                    origins[i] = origin
+            parent_phase = phase_from_origins(origins.get(0, "not_tested"), origins.get(1, "not_tested"))
+            parent_bam_phase = parent_phase
+            if parent_phase in {"cis", "trans"}:
+                result["phase"] = parent_phase
+                result["score"] = args.parent_bam_weight if parent_phase == "cis" else -args.parent_bam_weight
+                method = "parent_vcf_bam_rescue" if any(vcf_origins.get(i) in {"maternal", "paternal"} for i in (0, 1)) else "parent_bam_rescue"
+            else:
+                method = "read_backed_parent_uninformative"
     result = add_metadata(result, args, variant1, variant2, span_start, span_end, origins, len(bridges), method)
+    result = add_parent_vcf_metadata(result, args, parent_vcf, parent_vcf_phase)
     result = add_parent_bam_metadata(result, args, parent_bam, parent_bam_phase)
     return result, variants, fragments
 
@@ -462,6 +562,10 @@ def pair_rows(args):
                 row_args.reference = row_value(row, "reference", args.reference)
                 row_args.vcf = row_value(row, "vcf", args.vcf)
                 row_args.sample = row_value(row, "sample", args.sample)
+                row_args.father_vcf = row_value(row, "father_vcf", args.father_vcf, missing_overrides=True)
+                row_args.mother_vcf = row_value(row, "mother_vcf", args.mother_vcf, missing_overrides=True)
+                row_args.father_sample = row_value(row, "father_sample", args.father_sample)
+                row_args.mother_sample = row_value(row, "mother_sample", args.mother_sample)
                 row_args.father_bam = row_value(row, "father_bam", args.father_bam, missing_overrides=True)
                 row_args.mother_bam = row_value(row, "mother_bam", args.mother_bam, missing_overrides=True)
                 yield (
@@ -497,6 +601,10 @@ def main():
     parser.add_argument("--pairs-tsv", help="Batch TSV with target variants and optional sample/proband/parent input columns")
     parser.add_argument("--vcf", help="Optional indexed VCF/BCF of nearby heterozygous bridge variants; can be overridden per batch row")
     parser.add_argument("--sample", help="Sample name in VCF; can be overridden per batch row; defaults to first sample")
+    parser.add_argument("--father-vcf", help="Optional father VCF/gVCF for fast parent rescue; can be overridden per batch row")
+    parser.add_argument("--mother-vcf", help="Optional mother VCF/gVCF for fast parent rescue; can be overridden per batch row")
+    parser.add_argument("--father-sample", help="Sample name in father VCF/gVCF; can be overridden per batch row; defaults to first sample")
+    parser.add_argument("--mother-sample", help="Sample name in mother VCF/gVCF; can be overridden per batch row; defaults to first sample")
     parser.add_argument("--father-bam", help="Optional father BAM/CRAM for parent-BAM rescue; can be overridden per batch row")
     parser.add_argument("--mother-bam", help="Optional mother BAM/CRAM for parent-BAM rescue; can be overridden per batch row")
     parser.add_argument("--min-parent-bam-depth", type=int, default=8, help="Minimum parent BAM depth to call no_alt or has_alt")
@@ -504,6 +612,7 @@ def main():
     parser.add_argument("--min-parent-bam-alt-frac", type=float, default=0.2, help="Minimum parent ALT read fraction for has_alt")
     parser.add_argument("--max-parent-bam-alt-depth-for-ref", type=int, default=1, help="Maximum ALT-supporting parent reads for no_alt")
     parser.add_argument("--max-parent-bam-alt-frac-for-ref", type=float, default=0.05, help="Maximum parent ALT read fraction for no_alt")
+    parser.add_argument("--parent-vcf-weight", type=float, default=10.0, help="Score assigned when parent VCF/gVCF rescue phases the target pair")
     parser.add_argument("--parent-bam-weight", type=float, default=10.0, help="Score assigned when parent BAM rescue phases the target pair")
     parser.add_argument("--window", type=int, default=1000, help="Bases to fetch around target pair")
     parser.add_argument("--max-bridges", type=int, default=200, help="Maximum nearby heterozygous variants to use")
