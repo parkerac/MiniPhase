@@ -13,6 +13,25 @@ from dataclasses import dataclass
 pysam = None
 MISSING_VALUES = {"", ".", "NA", "N/A", "NONE", "NULL", "NAN"}
 REFERENCE_CACHE = {}
+PAIR_COLUMNS = {
+    "chrom",
+    "pos1",
+    "ref1",
+    "alt1",
+    "pos2",
+    "ref2",
+    "alt2",
+    "bam",
+    "reference",
+    "vcf",
+    "sample",
+    "father_vcf",
+    "mother_vcf",
+    "father_sample",
+    "mother_sample",
+    "father_bam",
+    "mother_bam",
+}
 
 
 @dataclass(frozen=True)
@@ -529,10 +548,22 @@ def phase_one(args, variant1, variant2):
     return result, variants, fragments
 
 
+def add_input_metadata(result, metadata):
+    for key, value in metadata.items():
+        out_key = key
+        if out_key in result:
+            out_key = f"input_{key}"
+        while out_key in result:
+            out_key = f"input_{out_key}"
+        result[out_key] = value
+    return result
+
+
 def phase_one_row(item):
-    row_index, args, variant1, variant2 = item
+    row_index, args, variant1, variant2, metadata = item
     result, _, _ = phase_one(args, variant1, variant2)
     result["row_index"] = row_index
+    add_input_metadata(result, metadata)
     return result
 
 
@@ -556,6 +587,7 @@ def pair_rows(args):
             missing = required - set(reader.fieldnames or [])
             if missing:
                 raise ValueError(f"{args.pairs_tsv} is missing columns: {', '.join(sorted(missing))}")
+            metadata_columns = [key for key in reader.fieldnames if key not in PAIR_COLUMNS]
             for row_index, row in enumerate(reader, start=1):
                 row_args = argparse.Namespace(**vars(args))
                 row_args.bam = row_value(row, "bam", args.bam)
@@ -573,9 +605,10 @@ def pair_rows(args):
                     row_args,
                     Variant(row["chrom"], int(row["pos1"]), row["ref1"].upper(), row["alt1"].upper(), "variant1", True),
                     Variant(row["chrom"], int(row["pos2"]), row["ref2"].upper(), row["alt2"].upper(), "variant2", True),
+                    {key: row.get(key, "") for key in metadata_columns},
                 )
     else:
-        yield 1, args, parse_variant(args.variant1, "variant1"), parse_variant(args.variant2, "variant2")
+        yield 1, args, parse_variant(args.variant1, "variant1"), parse_variant(args.variant2, "variant2"), {}
 
 
 def init_worker():
@@ -587,7 +620,7 @@ def init_worker():
 
 
 def job_reference_key(job):
-    _, row_args, _, _ = job
+    _, row_args, _, _, _ = job
     return os.path.realpath(row_args.reference) if row_args.reference else ""
 
 
@@ -650,9 +683,10 @@ def main():
         with mp.Pool(args.threads, initializer=init_worker) as pool:
             rows = list(pool.imap(phase_one_row, jobs, chunksize=args.chunksize))
     else:
-        for row_index, row_args, variant1, variant2 in jobs:
+        for row_index, row_args, variant1, variant2, metadata in jobs:
             result, variants, fragments = phase_one(row_args, variant1, variant2)
             result["row_index"] = row_index
+            add_input_metadata(result, metadata)
             rows.append(result)
             last = result, variants, fragments
     if args.pairs_tsv:

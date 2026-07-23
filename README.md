@@ -66,6 +66,8 @@ chr1	300000	C	A	300150	G	T	sample3.bam	GRCh38.fa	sample3.vcf.gz	SAMPLE3	NA	NA	NA
 
 `bam`, `reference`, `vcf`, `sample`, `father_vcf`, `mother_vcf`, `father_sample`, `mother_sample`, `father_bam`, and `mother_bam` columns override the matching command-line values for that row. This means you can provide common defaults globally and only include columns that vary by sample. A reference FASTA is required for CRAM inputs and recommended for indels.
 
+Column order does not matter for required or recognized input columns because they are read by header name. Extra metadata columns are preserved in the output TSV in their original relative order. If an extra metadata column has the same name as a phasing output column, it is written with an `input_` prefix to avoid overwriting the phasing result.
+
 Reference paths are canonicalized internally. In batch mode, rows are grouped by reference for processing and then written back in the original input order. Each worker process keeps one open FASTA handle per reference path, which helps avoid repeated reference setup when many rows share the same FASTA.
 
 Contig names are corrected at fetch time for common reference/header mismatches. For example, a target listed as `chr10` can still be fetched from a BAM/CRAM, VCF, or FASTA-indexed setup that uses `10`, and mitochondrial aliases `M`, `MT`, `chrM`, and `chrMT` are handled similarly.
